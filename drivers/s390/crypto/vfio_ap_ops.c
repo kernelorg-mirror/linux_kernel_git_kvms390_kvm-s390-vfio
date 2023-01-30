@@ -30,7 +30,6 @@
 #define AP_QUEUE_UNASSIGNED "unassigned"
 #define AP_QUEUE_IN_USE "in use"
 
-#define MAX_RESET_CHECK_WAIT	200	/* Sleep max 200ms for reset check	*/
 #define AP_RESET_INTERVAL		20	/* Reset sleep interval (20ms)		*/
 
 static int vfio_ap_mdev_reset_queues(struct ap_queue_table *qtable);
@@ -1622,39 +1621,61 @@ static int apq_status_check(int apqn, struct ap_queue_status *status)
 	}
 }
 
+#define WAIT_MSG "Waited %dms for reset of queue %02x.%04x (%u, %u, %u)"
+
 static int apq_reset_check(struct vfio_ap_queue *q)
 {
-	int ret;
-	int iters = MAX_RESET_CHECK_WAIT / AP_RESET_INTERVAL;
+	int ret = -EBUSY, elapsed = 0;
 	struct ap_queue_status status;
 
-	for (; iters > 0; iters--) {
-		msleep(AP_RESET_INTERVAL);
-		status = ap_tapq(q->apqn, NULL);
-		ret = apq_status_check(q->apqn, &status);
-		if (ret != -EBUSY)
+	while (true) {
+		if (ret == -EIO)
 			return ret;
+		if (ret == -EBUSY) {
+			msleep(AP_RESET_INTERVAL);
+			elapsed += AP_RESET_INTERVAL;
+			pr_notice_ratelimited(WAIT_MSG, elapsed,
+					      AP_QID_CARD(q->apqn),
+					      AP_QID_QUEUE(q->apqn),
+					      (elapsed == AP_RESET_INTERVAL) ?
+					      q->reset_rc : status.response_code,
+					      status.queue_empty,
+					      status.irq_enabled);
+			status = ap_tapq(q->apqn, NULL);
+			ret = apq_status_check(q->apqn, &status);
+		} else {
+			if (q->reset_rc == AP_RESPONSE_RESET_IN_PROGRESS ||
+			    q->reset_rc == AP_RESPONSE_BUSY) {
+				status = ap_zapq(q->apqn, 0);
+				q->reset_rc = status.response_code;
+				ret = apq_status_check(q->apqn, &status);
+				continue;
+			}
+			/*
+			 * When an AP adapter is deconfigured, the associated
+			 * queues are reset, so let's set the status response
+			 * code to 0 so the queue may be passed through (i.e.,
+			 * not filtered).
+			 */
+			if (q->reset_rc == AP_RESPONSE_DECONFIGURED)
+				q->reset_rc = 0;
+			break;
+		}
 	}
-	WARN_ONCE(iters <= 0,
-		  "timeout verifying reset of queue %02x.%04x (%u, %u, %u)",
-		  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
-		  status.queue_empty, status.irq_enabled, status.response_code);
 	return ret;
 }
 
 static int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q)
 {
 	struct ap_queue_status status;
-	int ret;
+	int ret = 0;
 
 	if (!q)
 		return 0;
-retry_zapq:
 	status = ap_zapq(q->apqn, 0);
 	q->reset_rc = status.response_code;
 	switch (status.response_code) {
 	case AP_RESPONSE_NORMAL:
-		ret = 0;
 		if (!status.irq_enabled)
 			vfio_ap_free_aqic_resources(q);
 		if (!status.queue_empty || status.irq_enabled) {
@@ -1671,9 +1692,7 @@ retry_zapq:
 		 * ZAPQ, then if it completes successfully, let's issue the ZAPQ.
 		 */
 		ret = apq_reset_check(q);
-		if (ret)
-			break;
-		goto retry_zapq;
+		break;
 	case AP_RESPONSE_DECONFIGURED:
 		/*
 		 * When an AP adapter is deconfigured, the associated
@@ -1682,7 +1701,6 @@ retry_zapq:
 		 * return a value indicating the reset completed successfully.
 		 */
 		q->reset_rc = 0;
-		ret = 0;
 		vfio_ap_free_aqic_resources(q);
 		break;
 	default:
