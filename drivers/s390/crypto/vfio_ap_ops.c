@@ -1647,7 +1647,8 @@ static void apq_reset_check(struct work_struct *reset_work)
 			ret = apq_status_check(q->apqn, &status);
 		} else {
 			if (q->reset_status.response_code == AP_RESPONSE_RESET_IN_PROGRESS ||
-			    q->reset_status.response_code == AP_RESPONSE_BUSY) {
+			    q->reset_status.response_code == AP_RESPONSE_BUSY ||
+			    q->reset_status.response_code == AP_RESPONSE_STATE_CHANGE_IN_PROGRESS) {
 				status = ap_zapq(q->apqn, 0);
 				memcpy(&q->reset_status, &status, sizeof(status));
 				ret = apq_status_check(q->apqn, &status);
@@ -1685,9 +1686,10 @@ static void vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q)
 		break;
 	case AP_RESPONSE_RESET_IN_PROGRESS:
 	case AP_RESPONSE_BUSY:
+	case AP_RESPONSE_STATE_CHANGE_IN_PROGRESS:
 		/*
-		 * There is a reset issued by another process in progress. Let's
-		 * wait for that to complete on a work queue.
+		 * The queue is busy, so let's queue a work thread to ensure
+		 * that the queue gets reset and zeroed out.
 		 */
 		queue_work(system_long_wq, &q->reset_work);
 		break;
